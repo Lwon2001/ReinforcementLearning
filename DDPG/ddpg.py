@@ -23,36 +23,43 @@ ENV_NAME = 'LunarLanderContinuous-v2'
 
 # DDPG Framework
 class ActorNet(nn.Module):  # 定义Actor与Critic的网络结构
-    def __init__(self, s_dim, a_dim):
+    def __init__(self, s_dim, a_dim, fc1_dim, fc2_dim):
         super(ActorNet, self).__init__()
-        self.fc1 = nn.Linear(s_dim, 30)
-        self.fc1.weight.data.normal_(0, 0.1)  # FC1的参数初始化
-        self.out = nn.Linear(30, a_dim)
-        self.out.weight.data.normal_(0, 0.1)  # OUT的参数初始化
+
+        self.fc1 = nn.Linear(s_dim, fc1_dim)
+        self.ln1 = nn.LayerNorm(fc1_dim)
+
+        self.fc2 = nn.Linear(fc1_dim, fc2_dim)
+        self.ln2 = nn.LayerNorm(fc2_dim)
+
+        self.out = nn.Linear(fc2_dim, a_dim)
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = F.relu(x)  # 激活函数为relu
+        x = F.relu(self.ln1(self.fc1(x)))  # 激活函数为relu
+        x = F.relu(self.ln2(self.fc2(x)))
         x = self.out(x)
         x = torch.tanh(x)  # 利用tanh将值映射到[-1,1]，因为该游戏的动作取值范围为[-1，1]
         return x
 
 
 class CriticNet(nn.Module):
-    def __init__(self, s_dim, a_dim):
+    def __init__(self, s_dim, a_dim, fc1_dim, fc2_dim):
         super(CriticNet, self).__init__()
-        self.fcs = nn.Linear(s_dim, 30)
-        self.fcs.weight.data.normal_(0, 0.1)
-        self.fca = nn.Linear(a_dim, 30)
-        self.fca.weight.data.normal_(0, 0.1)
-        self.out = nn.Linear(30, 1)
-        self.out.weight.data.normal_(0, 0.1)
+        self.fc1 = nn.Linear(s_dim, fc1_dim)
+        self.ln1 = nn.LayerNorm(fc1_dim)
+        self.fc2 = nn.Linear(fc1_dim, fc2_dim)
+        self.ln2 = nn.LayerNorm(fc2_dim)
+        self.fc3 = nn.Linear(a_dim, fc2_dim)
+        self.q = nn.Linear(fc2_dim, 1)
 
     def forward(self, s, a):
-        x = self.fcs(s)
-        y = self.fca(a)
-        actions_value = self.out(F.relu(x + y))
-        return actions_value
+        x_s = F.relu(self.ln1(self.fc1(s)))
+        x_s = self.ln2(self.fc2(x_s))
+        x_a = self.fc3(a)
+        x = F.relu(x_s + x_a)
+        q = self.q(x)
+
+        return q
 
 
 class DDPG(object):
@@ -65,13 +72,13 @@ class DDPG(object):
         self.actor_loss_list = []
         self.critic_loss_list = []
         # 构建四个网络
-        self.actor_eval = ActorNet(s_dim, a_dim)
-        self.actor_target = ActorNet(s_dim, a_dim)
-        self.critic_eval = CriticNet(s_dim, a_dim)
-        self.critic_target = CriticNet(s_dim, a_dim)
+        self.actor = ActorNet(s_dim, a_dim, 400, 300)
+        self.actor_target = ActorNet(s_dim, a_dim, 400, 300)
+        self.critic = CriticNet(s_dim, a_dim, 400, 300)
+        self.critic_target = CriticNet(s_dim, a_dim, 400, 300)
         # 构建actor与critic的optimizer（Adam）
-        self.actor_optimizer = torch.optim.Adam(self.actor_eval.parameters(), lr=LR_ACTOR)
-        self.critic_optimizer = torch.optim.Adam(self.critic_eval.parameters(), lr=LR_CRITIC)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=LR_ACTOR)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
         # 定义训练critic的计算loss函数
         self.loss_func = nn.MSELoss()  # 均方损失函数
 
@@ -83,16 +90,16 @@ class DDPG(object):
 
     def choose_action(self, s):  # 选择动作
         s = torch.unsqueeze(torch.FloatTensor(s), 0)
-        return self.actor_eval(s)[0].detach()  # 输出的同时切断反向传播
+        return self.actor(s)[0].detach()  # 输出的同时切断反向传播
 
     def learn(self):
         # softly update the target networks
         for x in self.actor_target.state_dict().keys():
             eval('self.actor_target.' + x + '.data.mul_((1-TAU))')
-            eval('self.actor_target.' + x + '.data.add_(TAU*self.actor_eval.' + x + '.data)')
+            eval('self.actor_target.' + x + '.data.add_(TAU*self.actor.' + x + '.data)')
         for x in self.critic_target.state_dict().keys():
             eval('self.critic_target.' + x + '.data.mul_((1-TAU))')
-            eval('self.critic_target.' + x + '.data.add_(TAU*self.critic_eval.' + x + '.data)')
+            eval('self.critic_target.' + x + '.data.add_(TAU*self.critic.' + x + '.data)')
         # 从buffer中随机选出一个batch进行训练
         indices = np.random.choice(MEMORY_CAPACITY, size=BATCH_SIZE)
         batch_trans = self.memory[indices, :]
@@ -103,8 +110,8 @@ class DDPG(object):
         batch_s_ = torch.FloatTensor(batch_trans[:, -self.s_dim:])
         '''训练Actor'''
         # 输入s至actor，输出动作a，然后用critic计算Q(s,a)
-        a = self.actor_eval(batch_s)
-        q = self.critic_eval(batch_s, a)
+        a = self.actor(batch_s)
+        q = self.critic(batch_s, a)
         actor_loss = -torch.mean(q)  # 梯度上升q，替换为梯度下降-q
         self.actor_loss_list.append(actor_loss)
         # 更新actor的参数:梯度归零->计算梯度->反向传播
@@ -117,7 +124,7 @@ class DDPG(object):
         q_tmp = self.critic_target(batch_s_, a_target)
         q_target = batch_r + GAMMA * q_tmp
         # 计算Q(s,a)和loss
-        q_eval = self.critic_eval(batch_s, batch_a)
+        q_eval = self.critic(batch_s, batch_a)
         td_error = self.loss_func(q_target, q_eval)
         self.critic_loss_list.append(td_error)
         # 更新critic的参数:梯度归零->计算梯度->反向传播
@@ -126,8 +133,8 @@ class DDPG(object):
         self.critic_optimizer.step()
 
     def save_model(self):
-        torch.save(self.actor_eval.state_dict(), 'actor_weights.pth')
-        torch.save(self.critic_eval.state_dict(), 'critic_weights.pth')
+        torch.save(self.actor.state_dict(), 'actor_weights.pth')
+        torch.save(self.critic.state_dict(), 'critic_weights.pth')
 
 
 # 配置gym
@@ -152,9 +159,9 @@ for i in range(EPISODES):
         a = ddpg.choose_action(s)
         a = np.clip(np.random.normal(a, var), a_low_bound, a_bound)
         s_, r, done, _, info = env.step(a)
-        ddpg.store_experiences(s, a, r / 10, s_)  # 存储与环境互动经验
+        ddpg.store_experiences(s, a, r , s_)  # 存储与环境互动经验
         if ddpg.pointer > MEMORY_CAPACITY:
-            var *= 0.9995  # decay the exploration controller factor
+            var *= 0.9999  # decay the exploration controller factor
             ddpg.learn()
 
         s = s_
